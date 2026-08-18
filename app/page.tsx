@@ -4,22 +4,24 @@ import { ContinueWatching } from "@/components/continue-watching";
 import { ContentRail } from "@/components/content-rail";
 import { SpotlightBanner } from "@/components/spotlight-banner";
 import { SiteFooter } from "@/components/site-footer";
-import { animeCatalog, homeRails } from "@/lib/anime-data";
+import { getHomeCatalog, type HomeCatalog } from "@/lib/anime-data";
 
-export default function Home() {
-  return (
-    <main className="site-shell">
-      <SiteHeader current="home" transparent />
-      <HeroCarousel />
-      <div className="home-content">
-        <ContinueWatching />
-        <ContentRail {...homeRails[0]} />
-        <SpotlightBanner />
-        <ContentRail {...homeRails[1]} />
-        <ContentRail eyebrow="This week's favorites" title="Top 10 on Luffy TV" items={[animeCatalog[0], animeCatalog[1], animeCatalog[2], animeCatalog[3], animeCatalog[4], animeCatalog[5], animeCatalog[6], animeCatalog[7], animeCatalog[8], animeCatalog[9]]} ranked />
-        <ContentRail {...homeRails[2]} />
-      </div>
-      <SiteFooter />
-    </main>
-  );
+export const dynamic = "force-dynamic";
+const emptyCatalog: HomeCatalog = { featured: [], latest: [], newReleases: [], newlyAdded: [], completed: [], top: [], all: [] };
+
+export default async function Home() {
+  const catalog = await getHomeCatalog().catch(() => emptyCatalog);
+  return <main className="site-shell">
+    <SiteHeader current="home" transparent />
+    <HeroCarousel items={catalog.featured} />
+    <div className="home-content">
+      <ContinueWatching catalog={catalog.all} />
+      <ContentRail eyebrow="Fresh from the live catalog" title="Latest episodes" items={catalog.latest} />
+      <SpotlightBanner anime={catalog.newReleases[3] || catalog.featured[1]} />
+      <ContentRail eyebrow="Your next obsession" title="New releases" items={catalog.newReleases} />
+      <ContentRail eyebrow="This week's favorites" title="Top 10 on Luffy TV" items={catalog.top} ranked />
+      <ContentRail eyebrow="Worth watching to the end" title="Recently completed" items={catalog.completed} />
+    </div>
+    <SiteFooter />
+  </main>;
 }

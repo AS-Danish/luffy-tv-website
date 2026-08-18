@@ -1,47 +1,42 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import Link from "next/link";
-import { animeCatalog } from "@/lib/anime-data";
+import { useEffect, useState } from "react";
+import { AnimeCard } from "@/components/anime-card";
+import { searchAnime, type AnimeRecord } from "@/lib/anime-data";
 
-const suggestions = ["Dark fantasy", "Found family", "Time travel", "Underrated gems", "Studio MAPPA"];
+const suggestions = ["Dark fantasy", "Romance", "Isekai", "Comedy", "Action"];
 
-export function SearchExperience() {
-  const [query, setQuery] = useState("");
-  const normalized = query.trim().toLowerCase();
-  const results = useMemo(() => {
-    if (!normalized) return animeCatalog.slice(0, 6);
-    return animeCatalog.filter((anime) => `${anime.title} ${anime.japaneseTitle} ${anime.studio} ${anime.genres.join(" ")}`.toLowerCase().includes(normalized));
-  }, [normalized]);
+export function SearchExperience({ popular, initialQuery = "" }: { popular: AnimeRecord[]; initialQuery?: string }) {
+  const [query, setQuery] = useState(initialQuery);
+  const [results, setResults] = useState<AnimeRecord[]>(initialQuery ? [] : popular.slice(0, 12));
+  const [loading, setLoading] = useState(Boolean(initialQuery));
+  const [error, setError] = useState("");
+  const normalized = query.trim();
 
-  return (
-    <div className="search-experience">
-      <div className="search-hero">
-        <p>Find your next obsession</p>
-        <h1>Search the collection.</h1>
-        <div className="giant-search">
-          <span aria-hidden="true">⌕</span>
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Try “dark fantasy” or “Frieren”" autoFocus />
-          {query ? <button type="button" onClick={() => setQuery("")}>Clear</button> : <kbd>⌘ K</kbd>}
-        </div>
-        <div className="search-suggestions"><span>Try</span>{suggestions.map((item) => <button type="button" onClick={() => setQuery(item.replace("Studio ", ""))} key={item}>{item}</button>)}</div>
-      </div>
+  useEffect(() => {
+    let active = true;
+    if (!normalized) {
+      setResults(popular.slice(0, 12));
+      setLoading(false);
+      setError("");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    const timer = window.setTimeout(() => {
+      searchAnime(normalized).then((items) => {
+        if (active) setResults(items);
+      }).catch(() => {
+        if (active) { setResults([]); setError("Search is temporarily unavailable."); }
+      }).finally(() => { if (active) setLoading(false); });
+    }, 350);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [normalized, popular]);
 
-      <section className="search-results">
-        <div className="search-results-heading"><div><p>{normalized ? "Search results" : "Popular right now"}</p><h2>{normalized ? `Matches for “${query}”` : "Start with a favorite"}</h2></div><span>{results.length} titles</span></div>
-        {results.length ? (
-          <div className="search-result-grid">
-            {results.map((anime) => (
-              <Link href={`/anime/${anime.slug}`} key={anime.slug}>
-                <div className="result-art"><img src={anime.poster} alt="" loading="lazy" /><span aria-hidden="true">↗</span></div>
-                <div><h3>{anime.title}</h3><p><strong>{anime.score.toFixed(1)}</strong> · {anime.genres.slice(0, 2).join(" / ")}</p><small>{anime.summary}</small></div>
-              </Link>
-            ))}
-          </div>
-        ) : (
-          <div className="empty-state"><span>⌕</span><h2>Nothing matched that search</h2><p>Try a title, studio, or a broader genre.</p></div>
-        )}
-      </section>
-    </div>
-  );
+  return <div className="search-experience">
+    <div className="search-hero"><p>Find your next obsession</p><h1>Search the collection.</h1><div className="giant-search"><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Try “dark fantasy” or an anime title" />{query ? <button type="button" onClick={() => setQuery("")}>Clear</button> : <kbd>⌘ K</kbd>}</div><div className="search-suggestions"><span>Try</span>{suggestions.map((item) => <button type="button" onClick={() => setQuery(item)} key={item}>{item}</button>)}</div></div>
+    <section className="search-results"><div className="search-results-heading"><div><p>{normalized ? "Search results" : "Popular right now"}</p><h2>{normalized ? `Matches for “${query}”` : "Start with a favorite"}</h2></div><span>{loading ? "Searching…" : `${results.length} titles`}</span></div>
+      {loading ? <div className="catalog-loading" aria-label="Searching"><i /><i /><i /><i /></div> : results.length ? <div className="browse-card-grid search-live-grid">{results.map((anime) => <AnimeCard anime={anime} key={anime.slug} />)}</div> : <div className="empty-state"><span>⌕</span><h2>{error || "Nothing matched that search"}</h2><p>Try a title or a broader genre.</p></div>}
+    </section>
+  </div>;
 }

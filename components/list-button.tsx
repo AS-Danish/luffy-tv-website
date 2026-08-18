@@ -8,9 +8,9 @@ export function readSavedList() {
   if (typeof window === "undefined") return [] as string[];
   try {
     const stored = window.localStorage.getItem(storageKey);
-    return stored ? (JSON.parse(stored) as string[]) : ["frieren", "solo-leveling", "jujutsu-kaisen"];
+    return stored ? (JSON.parse(stored) as string[]) : [];
   } catch {
-    return ["frieren", "solo-leveling", "jujutsu-kaisen"];
+    return [];
   }
 }
 
