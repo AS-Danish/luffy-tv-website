@@ -111,18 +111,23 @@ type AniListArtwork = {
 };
 
 const DEFAULT_API_BASE_URL = "https://anikoto-api-teramoto-danish.vercel.app";
-const DEFAULT_FALLBACK_API_BASE_URL = "https://anikototvapi.vercel.app";
 const ANILIST_API_URL = "https://graphql.anilist.co";
 const RESPONSE_CACHE_TTL = 5 * 60 * 1000;
 const ARTWORK_CACHE_TTL = 12 * 60 * 60 * 1000;
-const responseCache = new Map<string, { expires: number; value: unknown }>();
+const NEGATIVE_ARTWORK_CACHE_TTL = 15 * 60 * 1000;
+const MAX_RESPONSE_CACHE_ENTRIES = 600;
+const MAX_ARTWORK_CACHE_ENTRIES = 1_200;
+type ResponseCacheEntry = { freshUntil: number; staleUntil: number; value: unknown };
+const responseCache = new Map<string, ResponseCacheEntry>();
+const responseInFlight = new Map<string, Promise<unknown>>();
 const artworkCache = new Map<string, { expires: number; value: AniListArtwork | null }>();
+const watchCache = new Map<string, { expires: number; value: WatchData }>();
+const watchInFlight = new Map<string, Promise<WatchData>>();
+const upstreamBackoff = new Map<string, { failures: number; blockedUntil: number }>();
+let artworkHydration: Promise<void> | null = null;
 
 export const animeApiBaseUrl = (
   process.env.NEXT_PUBLIC_ANIME_API_BASE_URL || DEFAULT_API_BASE_URL
-).replace(/\/$/, "");
-export const fallbackAnimeApiBaseUrl = (
-  process.env.NEXT_PUBLIC_FALLBACK_ANIME_API_BASE_URL || DEFAULT_FALLBACK_API_BASE_URL
 ).replace(/\/$/, "");
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -169,6 +174,15 @@ function stripHtml(value: string) {
     .trim();
 }
 
+function cleanSummary(value: string) {
+  const cleaned = stripHtml(value)
+    .replace(/\s*\*+\s*(?:this includes|note:|includes the following special episodes)[\s\S]*$/i, "")
+    .trim();
+  if (cleaned.length <= 720) return cleaned;
+  const shortened = cleaned.slice(0, 717);
+  return `${shortened.slice(0, shortened.lastIndexOf(" "))}…`;
+}
+
 function parseYear(...values: unknown[]) {
   for (const value of values) {
     const match = stringValue(value).match(/(?:19|20)\d{2}/);
@@ -200,20 +214,30 @@ function episodeStatus(raw: JsonRecord) {
   return { sub, dub, total, latest: Math.max(sub, dub, total) };
 }
 
+function normalizeAnimeSlug(value: string) {
+  return value
+    .replace(/^\/?(?:watch|anime)\//i, "")
+    .replace(/\/ep-\d+(?:$|[/?#].*)/i, "")
+    .replace(/^\/+|\/+$/g, "");
+}
+
 function normalizeAnime(raw: JsonRecord, overrides: Partial<AnimeRecord> = {}): AnimeRecord {
   const episodes = episodeStatus(raw);
   const title = stringValue(raw.title, "Untitled anime");
+  const slug = normalizeAnimeSlug(stringValue(raw.slug, stringValue(raw.id)));
   const image = stringValue(raw.image, stringValue(raw.poster, stringValue(raw.backgroundImage)));
+  const posterImage = stringValue(raw.poster, image);
+  const backdropImage = stringValue(raw.backgroundImage, stringValue(raw.bannerImage, image));
   const score = numberValue(raw.malScore ?? raw.score);
   const type = normalizeFormat(stringValue(raw.type, "Series"));
-  const summary = stripHtml(stringValue(raw.synopsis, stringValue(raw.description, "Synopsis is being prepared.")));
+  const summary = cleanSummary(stringValue(raw.synopsis, stringValue(raw.description, "Synopsis is being prepared.")));
   const genres = stringArray(raw.genres);
   const studios = stringArray(raw.studios);
   const rawEpisodeCount = numberValue(raw.episodeCount ?? raw.totalEpisodes, episodes.total);
 
   return {
-    id: stringValue(raw.id, stringValue(raw.slug)),
-    slug: stringValue(raw.slug),
+    id: stringValue(raw.id, slug),
+    slug,
     title,
     eyebrow: stringValue(raw.quality) ? `${stringValue(raw.quality)} streaming` : "Now on Luffy TV",
     japaneseTitle: stringValue(raw.titleJp, stringValue(raw.japaneseTitle, title)),
@@ -232,30 +256,89 @@ function normalizeAnime(raw: JsonRecord, overrides: Partial<AnimeRecord> = {}): 
     genres,
     studio: studios[0] || stringValue(raw.studio, "Independent"),
     summary,
-    poster: image || "/luffy-tv-logo-256.png",
-    backdrop: image || "/luffy-tv-logo-256.png",
+    poster: posterImage || image || "/luffy-tv-logo-256.png",
+    backdrop: backdropImage || image || posterImage || "/luffy-tv-logo-256.png",
     accent: "#ff671d",
     ...overrides,
   };
 }
 
-async function fetchJson(pathOrUrl: string, ttl = RESPONSE_CACHE_TTL, timeout = 30_000): Promise<unknown> {
-  const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${animeApiBaseUrl}${pathOrUrl}`;
-  const cached = responseCache.get(url);
-  if (cached && cached.expires > Date.now()) return cached.value;
+function setBoundedCache<T>(cache: Map<string, T>, key: string, value: T, maximum: number) {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > maximum) {
+    const oldest = cache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
+
+function retryAfterMilliseconds(response: Response) {
+  const value = response.headers.get("retry-after");
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1_000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+async function loadJson(url: string, ttl: number, timeout: number) {
+  const origin = new URL(url).origin;
+  const backoff = upstreamBackoff.get(origin);
+  if (backoff && backoff.blockedUntil > Date.now()) {
+    throw new Error(`Anime API is cooling down after rate limiting (${origin})`);
+  }
 
   const response = await fetch(url, {
+    cache: "no-store",
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(timeout),
   });
-  if (!response.ok) throw new Error(`Anime API request failed (${response.status})`);
+  if (!response.ok) {
+    if (response.status === 429 || response.status >= 500) {
+      const failures = Math.min(6, (backoff?.failures || 0) + 1);
+      const retryAfter = retryAfterMilliseconds(response);
+      const delay = Math.min(2 * 60 * 1000, Math.max(retryAfter, 1_000 * 2 ** failures));
+      upstreamBackoff.set(origin, { failures, blockedUntil: Date.now() + delay });
+    }
+    throw new Error(`Anime API request failed (${response.status})`);
+  }
+
+  upstreamBackoff.delete(origin);
   const value = (await response.json()) as unknown;
-  responseCache.set(url, { expires: Date.now() + ttl, value });
+  const now = Date.now();
+  setBoundedCache(responseCache, url, {
+    freshUntil: now + ttl,
+    staleUntil: now + Math.max(ttl * 6, 60 * 60 * 1000),
+    value,
+  }, MAX_RESPONSE_CACHE_ENTRIES);
   return value;
 }
 
-async function fetchFirstJson(urls: string[], ttl = RESPONSE_CACHE_TTL) {
-  return Promise.any(urls.map((url) => fetchJson(url, ttl)));
+async function fetchJson(pathOrUrl: string, ttl = RESPONSE_CACHE_TTL, timeout = 8_000): Promise<unknown> {
+  const url = pathOrUrl.startsWith("http") ? pathOrUrl : `${animeApiBaseUrl}${pathOrUrl}`;
+  const cached = responseCache.get(url);
+  const now = Date.now();
+  if (cached?.freshUntil && cached.freshUntil > now) {
+    setBoundedCache(responseCache, url, cached, MAX_RESPONSE_CACHE_ENTRIES);
+    return cached.value;
+  }
+
+  const existing = responseInFlight.get(url);
+  if (existing) {
+    return cached && cached.staleUntil > now ? cached.value : existing;
+  }
+
+  const request = loadJson(url, ttl, timeout).finally(() => {
+    if (responseInFlight.get(url) === request) responseInFlight.delete(url);
+  });
+  responseInFlight.set(url, request);
+
+  if (cached && cached.staleUntil > now) {
+    void request.catch(() => undefined);
+    return cached.value;
+  }
+  return request;
 }
 
 function titleCacheKey(title: string) {
@@ -278,7 +361,7 @@ function parseAniListMedia(value: unknown): AniListArtwork | null {
     cover: stringValue(cover.extraLarge, stringValue(cover.large)),
     banner: stringValue(value.bannerImage),
     color: stringValue(cover.color),
-    description: stripHtml(stringValue(value.description)),
+    description: cleanSummary(stringValue(value.description)),
     genres: stringArray(value.genres),
     score: numberValue(value.averageScore) / 10,
     year: numberValue(startDate.year),
@@ -326,20 +409,13 @@ async function fetchArtworkChunk(titles: string[]) {
   return titles.map((title, index) => ({ title, artwork: parseAniListMedia(data[`a${index}`]) }));
 }
 
-async function getArtwork(titles: string[]) {
-  const uniqueTitles = [...new Map(titles.filter(Boolean).map((title) => [titleCacheKey(title), title])).values()];
-  const found = new Map<string, AniListArtwork | null>();
-  const missing: string[] = [];
-
-  for (const title of uniqueTitles) {
-    const key = titleCacheKey(title);
-    const cached = artworkCache.get(key);
-    if (cached && cached.expires > Date.now()) found.set(key, cached.value);
-    else missing.push(title);
-  }
-
-  const chunkSize = 3;
-  const chunks = Array.from({ length: Math.ceil(missing.length / chunkSize) }, (_, index) => missing.slice(index * chunkSize, index * chunkSize + chunkSize));
+async function hydrateArtwork(titles: string[]) {
+  // A few wider GraphQL queries are both faster and less likely to hit
+  // AniList's request-rate limit than dozens of tiny requests. The global
+  // hydration gate also prevents concurrent page renders from duplicating
+  // the same cold artwork batch.
+  const chunkSize = 8;
+  const chunks = Array.from({ length: Math.ceil(titles.length / chunkSize) }, (_, index) => titles.slice(index * chunkSize, index * chunkSize + chunkSize));
   const resolved: Array<{ title: string; artwork: AniListArtwork | null }> = [];
   let cursor = 0;
   async function artworkWorker() {
@@ -352,13 +428,40 @@ async function getArtwork(titles: string[]) {
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(8, chunks.length) }, () => artworkWorker()));
+  await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, () => artworkWorker()));
   for (const result of resolved) {
     const key = titleCacheKey(result.title);
-    if (result.artwork) artworkCache.set(key, { expires: Date.now() + ARTWORK_CACHE_TTL, value: result.artwork });
-    found.set(key, result.artwork);
+    setBoundedCache(artworkCache, key, {
+      expires: Date.now() + (result.artwork ? ARTWORK_CACHE_TTL : NEGATIVE_ARTWORK_CACHE_TTL),
+      value: result.artwork,
+    }, MAX_ARTWORK_CACHE_ENTRIES);
+  }
+}
+
+async function getArtwork(titles: string[]) {
+  const uniqueTitles = [...new Map(titles.filter(Boolean).map((title) => [titleCacheKey(title), title])).values()];
+
+  while (true) {
+    const missing = uniqueTitles.filter((title) => {
+      const cached = artworkCache.get(titleCacheKey(title));
+      return !cached || cached.expires <= Date.now();
+    });
+    if (!missing.length) break;
+    if (artworkHydration) {
+      await artworkHydration;
+      continue;
+    }
+    artworkHydration = hydrateArtwork(missing).finally(() => {
+      artworkHydration = null;
+    });
+    await artworkHydration;
   }
 
+  const found = new Map<string, AniListArtwork | null>();
+  for (const title of uniqueTitles) {
+    const key = titleCacheKey(title);
+    found.set(key, artworkCache.get(key)?.value || null);
+  }
   return found;
 }
 
@@ -411,10 +514,7 @@ function uniqueAnime(records: AnimeRecord[]) {
 }
 
 export async function getHomeCatalog(): Promise<HomeCatalog> {
-  const payload = unwrapData(await fetchFirstJson([
-    `${animeApiBaseUrl}/api/home`,
-    `${fallbackAnimeApiBaseUrl}/api/`,
-  ]));
+  const payload = unwrapData(await fetchJson("/api/home"));
   if (!isRecord(payload)) throw new Error("The home catalog response was invalid.");
 
   const groups = {
@@ -426,7 +526,13 @@ export async function getHomeCatalog(): Promise<HomeCatalog> {
     top: recordArray(payload.topWeek ?? payload.topAiring).slice(0, 10).map((item) => normalizeAnime(item)),
   };
   const rawAll = uniqueAnime(Object.values(groups).flat());
-  const enhanced = await enrichAnime(rawAll);
+  const featuredSlugs = new Set(groups.featured.map((item) => item.slug));
+  const rest = rawAll.filter((item) => !featuredSlugs.has(item.slug));
+  const [featured, remaining] = await Promise.all([
+    enrichAnimeWithin(groups.featured, 7_000),
+    enrichAnimeWithin(rest, 5_500),
+  ]);
+  const enhanced = uniqueAnime([...featured, ...remaining]);
   const bySlug = new Map(enhanced.map((item) => [item.slug, item]));
   const remap = (items: AnimeRecord[]) => items.map((item) => bySlug.get(item.slug) || item);
 
@@ -445,10 +551,7 @@ export async function searchAnime(keyword: string): Promise<AnimeRecord[]> {
   const trimmed = keyword.trim();
   if (!trimmed) return [];
   const encoded = encodeURIComponent(trimmed);
-  const payload = unwrapData(await fetchFirstJson([
-    `${animeApiBaseUrl}/api/search?keyword=${encoded}`,
-    `${fallbackAnimeApiBaseUrl}/api/search?keyword=${encoded}`,
-  ], 60_000));
+  const payload = unwrapData(await fetchJson(`/api/search?keyword=${encoded}`, 60_000));
   const records = (Array.isArray(payload) ? recordArray(payload) : isRecord(payload) ? recordArray(payload.results) : [])
     .slice(0, 30).map((item) => normalizeAnime(item));
   return enrichAnime(records);
@@ -458,12 +561,9 @@ export async function getAnimeDetail(slug: string): Promise<AnimeRecord | null> 
   if (!slug) return null;
   try {
     const encoded = encodeURIComponent(slug);
-    const payload = unwrapData(await fetchFirstJson([
-      `${animeApiBaseUrl}/api/anime/${encoded}`,
-      `${fallbackAnimeApiBaseUrl}/api/info?id=${encoded}`,
-    ]));
+    const payload = unwrapData(await fetchJson(`/api/anime/${encoded}`));
     if (!isRecord(payload)) return null;
-    const [anime] = await enrichAnime([normalizeAnime(payload)]);
+    const [anime] = await enrichAnimeWithin([normalizeAnime(payload)], 4_500);
     return anime || null;
   } catch {
     return null;
@@ -473,10 +573,11 @@ export async function getAnimeDetail(slug: string): Promise<AnimeRecord | null> 
 export async function getAnimeEpisodes(slug: string, duration = "24m"): Promise<EpisodeRecord[]> {
   try {
     const encoded = encodeURIComponent(slug);
-    const payload = unwrapData(await fetchFirstJson([
-      `${animeApiBaseUrl}/api/anime/${encoded}/episodes`,
-      `${fallbackAnimeApiBaseUrl}/api/episodes/${encoded}`,
-    ]));
+    const payload = unwrapData(await fetchJson(
+      `/api/anime/${encoded}/episodes`,
+      RESPONSE_CACHE_TTL,
+      7_500,
+    ));
     if (!isRecord(payload)) return [];
     return recordArray(payload.episodes).map((episode) => {
       const episodeNumber = numberValue(episode.number ?? episode.episode_no);
@@ -496,100 +597,24 @@ export async function getAnimeEpisodes(slug: string, duration = "24m"): Promise<
 
 export async function getRelatedAnime(slug: string): Promise<AnimeRecord[]> {
   const encoded = encodeURIComponent(slug);
-  const responses = await Promise.allSettled(["related", "recommendations"].map((endpoint) =>
-    fetchJson(`/api/anime/${encoded}/${endpoint}`, RESPONSE_CACHE_TTL, 6_000),
-  ));
-  for (const response of responses) {
-    if (response.status === "fulfilled") {
-      const payload = unwrapData(response.value);
+  for (const endpoint of ["related", "recommendations"]) {
+    try {
+      const payload = unwrapData(await fetchJson(
+        `/api/anime/${encoded}/${endpoint}`,
+        RESPONSE_CACHE_TTL,
+        5_000,
+      ));
       const records = Array.isArray(payload)
         ? recordArray(payload)
         : isRecord(payload)
           ? recordArray(payload.results ?? payload.related ?? payload.recommendations)
           : [];
-      if (records.length) return enrichAnimeWithin(records.slice(0, 8).map((item) => normalizeAnime(item)), 5_000);
+      if (records.length) return enrichAnimeWithin(records.slice(0, 8).map((item) => normalizeAnime(item)), 4_500);
+    } catch {
+      // Recommendations are a fallback, not a parallel duplicate request.
     }
   }
   return [];
-}
-
-async function getFallbackWatchData(slug: string, episode: number, signal?: AbortSignal): Promise<WatchData> {
-  const encodedSlug = encodeURIComponent(slug);
-  const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(45_000)]) : AbortSignal.timeout(45_000);
-  const episodeResponse = await fetch(`${fallbackAnimeApiBaseUrl}/api/episodes/${encodedSlug}`, { signal: requestSignal });
-  if (!episodeResponse.ok) throw new Error("The backup episode index is unavailable.");
-  const episodePayload = unwrapData((await episodeResponse.json()) as unknown);
-  const episodeItems = isRecord(episodePayload) ? recordArray(episodePayload.episodes) : [];
-  const episodeRaw = episodeItems.find((item) => numberValue(item.episode_no ?? item.number) === episode);
-  if (!episodeRaw) throw new Error("The backup API could not find this episode.");
-
-  const serverIds = stringValue(episodeRaw.server_ids, stringValue(episodeRaw.id));
-  const serverResponse = await fetch(`${fallbackAnimeApiBaseUrl}/api/servers?ids=${encodeURIComponent(serverIds)}`, { signal: requestSignal });
-  if (!serverResponse.ok) throw new Error("The backup server list is unavailable.");
-  const serverPayload = unwrapData((await serverResponse.json()) as unknown);
-  const serverItems = recordArray(serverPayload).slice(0, 6);
-
-  const resolved = await Promise.all(serverItems.map(async (server) => {
-    const linkId = stringValue(server.link_id, stringValue(server.linkId, stringValue(server.id)));
-    if (!linkId) return null;
-    try {
-      const response = await fetch(`${fallbackAnimeApiBaseUrl}/api/stream/resolve?id=${encodeURIComponent(linkId)}&slug=${encodedSlug}`, { signal: requestSignal });
-      if (!response.ok) return null;
-      const data = unwrapData((await response.json()) as unknown);
-      if (!isRecord(data)) return null;
-      const url = stringValue(data.url);
-      if (!url) return null;
-      const subtitles = recordArray(data.subtitles);
-      return {
-        server: stringValue(server.name, stringValue(server.normalizedName, "Backup")),
-        type: stringValue(server.type, "sub"),
-        url: stringValue(data.embedUrl, url),
-        m3u8: url,
-        proxyUrl: `${fallbackAnimeApiBaseUrl}/api/stream/proxy?url=${encodeURIComponent(url)}`,
-        tracks: subtitles.map((track) => ({
-          file: stringValue(track.url, stringValue(track.file)),
-          label: stringValue(track.label, stringValue(track.language, "Subtitles")),
-          kind: "captions",
-          default: booleanValue(track.default),
-        })),
-        skipData: isRecord(data.skipData) ? data.skipData : null,
-      } satisfies VideoSource & { skipData: JsonRecord | null };
-    } catch {
-      return null;
-    }
-  }));
-  const sources = resolved.filter((source): source is NonNullable<typeof source> => Boolean(source));
-  if (!sources.length) throw new Error("Neither API could resolve a playable server.");
-  const skipRaw = sources.find((source) => source.skipData)?.skipData;
-  const parseFallbackRange = (value: unknown) => {
-    if (Array.isArray(value)) return { start: numberValue(value[0]), end: numberValue(value[1]) };
-    return isRecord(value) ? { start: numberValue(value.start), end: numberValue(value.end) } : undefined;
-  };
-  return {
-    episode: {
-      number: episode,
-      title: stringValue(episodeRaw.title, `Episode ${episode}`),
-      duration: "",
-      released: "Available now",
-      id: stringValue(episodeRaw.id) || undefined,
-      hasSub: true,
-      hasDub: false,
-    },
-    skipData: skipRaw ? { intro: parseFallbackRange(skipRaw.intro), outro: parseFallbackRange(skipRaw.outro) } : null,
-    servers: serverItems.map((server) => ({
-      id: stringValue(server.link_id, stringValue(server.linkId, stringValue(server.id))),
-      name: stringValue(server.name, "Backup"),
-      type: stringValue(server.type, "sub"),
-    })),
-    sources: sources.map((source) => ({
-      server: source.server,
-      type: source.type,
-      url: source.url,
-      m3u8: source.m3u8,
-      proxyUrl: source.proxyUrl,
-      tracks: source.tracks,
-    })),
-  };
 }
 
 async function getPrimaryWatchData(slug: string, episode: number, signal?: AbortSignal): Promise<WatchData> {
@@ -643,12 +668,26 @@ async function getPrimaryWatchData(slug: string, episode: number, signal?: Abort
 }
 
 export async function getWatchData(slug: string, episode: number, signal?: AbortSignal): Promise<WatchData> {
-  try {
-    return await getPrimaryWatchData(slug, episode, signal);
-  } catch (primaryError) {
-    if (signal?.aborted) throw primaryError;
-    return getFallbackWatchData(slug, episode, signal);
+  const key = `${slug.toLocaleLowerCase()}:${episode}`;
+  const cached = watchCache.get(key);
+  if (!signal && cached && cached.expires > Date.now()) return cached.value;
+  if (!signal) {
+    const existing = watchInFlight.get(key);
+    if (existing) return existing;
   }
+
+  const request = getPrimaryWatchData(slug, episode, signal).then((data) => {
+    if (!signal) setBoundedCache(watchCache, key, { expires: Date.now() + 60_000, value: data }, 120);
+    return data;
+  });
+
+  if (!signal) {
+    watchInFlight.set(key, request);
+    void request.finally(() => {
+      if (watchInFlight.get(key) === request) watchInFlight.delete(key);
+    }).catch(() => undefined);
+  }
+  return request;
 }
 
 export function absoluteApiUrl(url?: string | null) {
@@ -659,31 +698,11 @@ export function absoluteApiUrl(url?: string | null) {
 
 export async function getSchedule(timezoneOffset = 0): Promise<ScheduleDay[]> {
   try {
-    let rawDays: JsonRecord[];
-    try {
-      const payload = unwrapData(await fetchJson(`/api/schedule?tz=${Math.trunc(timezoneOffset)}&images=true`));
-      if (!Array.isArray(payload)) throw new Error("Invalid primary schedule response");
-      rawDays = payload.filter(isRecord);
-    } catch {
-      const today = new Date();
-      rawDays = await Promise.all(Array.from({ length: 7 }, async (_, index) => {
-        const date = new Date(today);
-        date.setUTCDate(today.getUTCDate() + index);
-        const isoDate = date.toISOString().slice(0, 10);
-        const payload = unwrapData(await fetchJson(`${fallbackAnimeApiBaseUrl}/api/schedule?date=${isoDate}`));
-        const animes = recordArray(payload).map((anime) => ({
-          ...anime,
-          date: stringValue(anime.time, "TBA"),
-          type: numberValue(anime.episode_no) ? `Episode ${numberValue(anime.episode_no)}` : "New episode",
-        }));
-        return {
-          day: date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "2-digit", timeZone: "UTC" }),
-          animes,
-        };
-      }));
-    }
+    const payload = unwrapData(await fetchJson(`/api/schedule?tz=${Math.trunc(timezoneOffset)}&images=true`));
+    if (!Array.isArray(payload)) throw new Error("Invalid schedule response");
+    const rawDays = payload.filter(isRecord);
     const allRaw = rawDays.flatMap((day) => recordArray(day.animes));
-    const enhanced = await enrichAnimeWithin(allRaw.map((item) => normalizeAnime(item)), 7_000);
+    const enhanced = await enrichAnimeWithin(allRaw.map((item) => normalizeAnime(item)), 6_000);
     const bySlug = new Map(enhanced.map((item) => [item.slug, item]));
     return rawDays.map((day) => ({
       day: stringValue(day.day),

@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import { searchAnime, type AnimeRecord } from "@/lib/anime-data";
+import type { AnimeRecord } from "@/lib/anime-data";
+import { searchAnime } from "@/lib/anime-client";
+import { ArtworkImage } from "@/components/artwork-image";
 
 type HeaderProps = { current?: "home" | "browse" | "schedule" | "list" | "search"; transparent?: boolean };
 const links = [
@@ -36,10 +38,11 @@ export function SiteHeader({ current, transparent = false }: HeaderProps) {
     let active = true;
     if (!normalized) { setResults([]); setLoading(false); return; }
     setLoading(true);
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      searchAnime(normalized).then((items) => { if (active) setResults(items.slice(0, 5)); }).catch(() => { if (active) setResults([]); }).finally(() => { if (active) setLoading(false); });
-    }, 300);
-    return () => { active = false; window.clearTimeout(timer); };
+      searchAnime(normalized, controller.signal).then((items) => { if (active) setResults(items.slice(0, 5)); }).catch((error: unknown) => { if (active && !(error instanceof DOMException && error.name === "AbortError")) setResults([]); }).finally(() => { if (active) setLoading(false); });
+    }, 450);
+    return () => { active = false; controller.abort(); window.clearTimeout(timer); };
   }, [query]);
 
   return <>
@@ -52,7 +55,7 @@ export function SiteHeader({ current, transparent = false }: HeaderProps) {
     {searchOpen ? <div className="command-backdrop" role="presentation" onMouseDown={() => setSearchOpen(false)}><section className="command-palette" role="dialog" aria-modal="true" aria-label="Search Luffy TV" onMouseDown={(event) => event.stopPropagation()}>
       <form className="command-input-wrap" action="/search"><span aria-hidden="true">⌕</span><input ref={inputRef} name="q" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search the live catalog..." /><button type="button" onClick={() => setSearchOpen(false)}>ESC</button></form>
       <p className="command-label">{query ? loading ? "Searching the API…" : "Best matches" : "Popular searches"}</p>
-      <div className="command-results">{query ? results.map((anime) => <Link href={`/anime/${anime.slug}`} onClick={() => setSearchOpen(false)} key={anime.slug}><img src={anime.poster} alt="" /><span><strong>{anime.title}</strong><small>{anime.year} · {anime.genres.slice(0, 2).join(" / ") || anime.type}</small></span><i aria-hidden="true">↗</i></Link>) : popularSearches.map((term) => <Link href={`/search?q=${encodeURIComponent(term)}`} onClick={() => setSearchOpen(false)} key={term}><span className="command-search-term"><strong>{term}</strong><small>Search the full catalog</small></span><i aria-hidden="true">↗</i></Link>)}{query && !loading && !results.length ? <div className="command-empty">No live titles found. Try a broader search.</div> : null}</div>
+      <div className="command-results">{query ? results.map((anime) => <Link href={`/anime/${anime.slug}`} onClick={() => setSearchOpen(false)} key={anime.slug}><ArtworkImage src={anime.poster} fallbacks={[anime.backdrop]} alt="" /><span><strong>{anime.title}</strong><small>{anime.year} · {anime.genres.slice(0, 2).join(" / ") || anime.type}</small></span><i aria-hidden="true">↗</i></Link>) : popularSearches.map((term) => <Link href={`/search?q=${encodeURIComponent(term)}`} onClick={() => setSearchOpen(false)} key={term}><span className="command-search-term"><strong>{term}</strong><small>Search the full catalog</small></span><i aria-hidden="true">↗</i></Link>)}{query && !loading && !results.length ? <div className="command-empty">No live titles found. Try a broader search.</div> : null}</div>
       <footer><span>ESC Close</span><span>↵ Search</span><Link href={`/search${query ? `?q=${encodeURIComponent(query)}` : ""}`} onClick={() => setSearchOpen(false)}>Advanced search →</Link></footer>
     </section></div> : null}
   </>;

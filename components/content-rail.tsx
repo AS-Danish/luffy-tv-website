@@ -3,6 +3,7 @@ import type { AnimeRecord } from "@/lib/anime-data";
 import { AnimeCard } from "@/components/anime-card";
 
 export function ContentRail({ title, eyebrow, items, ranked = false }: { title: string; eyebrow: string; items: AnimeRecord[]; ranked?: boolean }) {
+  if (!items.length) return null;
   return (
     <section className={`content-section${ranked ? " ranked-section" : ""}`}>
       <div className="section-heading">

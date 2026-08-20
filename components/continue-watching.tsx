@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import type { AnimeRecord } from "@/lib/anime-data";
+import { ArtworkImage } from "@/components/artwork-image";
 
 export const playbackStorageKey = "luffy-tv-progress-v1";
 
@@ -40,7 +41,7 @@ export function ContinueWatching({ catalog }: { catalog: AnimeRecord[] }) {
           const percentage = saved.duration ? Math.min(100, saved.time / saved.duration * 100) : 0;
           const remainingMinutes = Math.max(1, Math.ceil((saved.duration - saved.time) / 60));
           return <Link className="continue-card" href={`/watch/${anime.slug}?episode=${saved.episode}`} key={anime.slug}>
-            <div className="continue-art"><img src={anime.backdrop || anime.poster} alt="" loading="lazy" decoding="async" /><div className="continue-shade" /><span className="continue-play" aria-hidden="true">▶</span><div className="progress-track"><span style={{ width: `${percentage}%` }} /></div><small>{remainingMinutes}m left</small></div>
+            <div className="continue-art"><ArtworkImage src={anime.backdrop} fallbacks={[anime.poster]} alt={`${anime.title} episode artwork`} loading="lazy" decoding="async" /><div className="continue-shade" /><span className="continue-play" aria-hidden="true">▶</span><div className="progress-track"><span style={{ width: `${percentage}%` }} /></div><small>{remainingMinutes}m left</small></div>
             <div><h3>{anime.title}</h3><p>Episode {saved.episode} <span>·</span> {anime.duration}</p></div>
           </Link>;
         })}

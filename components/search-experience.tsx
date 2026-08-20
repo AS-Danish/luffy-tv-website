@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { AnimeCard } from "@/components/anime-card";
-import { searchAnime, type AnimeRecord } from "@/lib/anime-data";
+import type { AnimeRecord } from "@/lib/anime-data";
+import { searchAnime } from "@/lib/anime-client";
 
 const suggestions = ["Dark fantasy", "Romance", "Isekai", "Comedy", "Action"];
 
@@ -23,14 +24,15 @@ export function SearchExperience({ popular, initialQuery = "" }: { popular: Anim
     }
     setLoading(true);
     setError("");
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      searchAnime(normalized).then((items) => {
+      searchAnime(normalized, controller.signal).then((items) => {
         if (active) setResults(items);
-      }).catch(() => {
-        if (active) { setResults([]); setError("Search is temporarily unavailable."); }
+      }).catch((reason: unknown) => {
+        if (active && !(reason instanceof DOMException && reason.name === "AbortError")) { setResults([]); setError("Search is temporarily unavailable."); }
       }).finally(() => { if (active) setLoading(false); });
-    }, 350);
-    return () => { active = false; window.clearTimeout(timer); };
+    }, 500);
+    return () => { active = false; controller.abort(); window.clearTimeout(timer); };
   }, [normalized, popular]);
 
   return <div className="search-experience">

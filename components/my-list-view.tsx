@@ -4,7 +4,8 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { AnimeCard } from "@/components/anime-card";
 import { readSavedList, writeSavedList } from "@/components/list-button";
-import { getAnimeDetail, type AnimeRecord } from "@/lib/anime-data";
+import type { AnimeRecord } from "@/lib/anime-data";
+import { getAnimeDetail } from "@/lib/anime-client";
 
 export function MyListView({ catalog }: { catalog: AnimeRecord[] }) {
   const [items, setItems] = useState<AnimeRecord[]>([]);
@@ -12,12 +13,18 @@ export function MyListView({ catalog }: { catalog: AnimeRecord[] }) {
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     const saved = readSavedList();
     const known = new Map(catalog.map((anime) => [anime.slug, anime]));
-    Promise.all(saved.map((slug) => known.get(slug) ? Promise.resolve(known.get(slug)!) : getAnimeDetail(slug)))
+    Promise.all(saved.slice(0, 100).map((slug) => known.get(slug) ? Promise.resolve(known.get(slug)!) : getAnimeDetail(slug, controller.signal)))
       .then((records) => { if (active) setItems(records.filter((record): record is AnimeRecord => Boolean(record))); })
+      .catch((reason: unknown) => {
+        if (active && !(reason instanceof DOMException && reason.name === "AbortError")) {
+          setItems(saved.flatMap((slug) => known.get(slug) || []));
+        }
+      })
       .finally(() => { if (active) setReady(true); });
-    return () => { active = false; };
+    return () => { active = false; controller.abort(); };
   }, [catalog]);
 
   const remove = (slug: string) => {
