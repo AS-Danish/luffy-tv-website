@@ -9,8 +9,8 @@ export function SiteFooter() {
       </div>
       <nav aria-label="Footer navigation">
         <div><strong>Explore</strong><Link href="/browse">Browse</Link><Link href="/schedule">Schedule</Link><Link href="/search">Search</Link></div>
-        <div><strong>Library</strong><Link href="/my-list">My List</Link><Link href="/my-list">Watch History</Link><Link href="/app">Offline viewing</Link></div>
-        <div><strong>Luffy TV</strong><Link href="/app">Android app</Link><span className="footer-nav-item">About</span><span className="footer-nav-item">Privacy</span><span className="footer-nav-item">Terms</span></div>
+        <div><strong>Library</strong><Link href="/my-list">My List</Link><Link href="/history">Watch History</Link><Link href="/app">Offline viewing</Link></div>
+        <div><strong>Luffy TV</strong><Link href="/app">Android app</Link><Link href="/about">About</Link><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><Link href="/help">Help</Link></div>
       </nav>
       <Link className="footer-app-callout" href="/app">
         <span className="footer-app-icon" aria-hidden="true">⌁</span>
