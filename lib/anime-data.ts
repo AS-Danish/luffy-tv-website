@@ -1,3 +1,10 @@
+import {
+  acceptedPlaybackRequestId,
+  playbackHost,
+  playbackLog,
+  safePlaybackMessage,
+} from "@/lib/playback-diagnostics";
+
 export type AnimeTrailer = {
   id: string;
   site: string;
@@ -617,12 +624,36 @@ export async function getRelatedAnime(slug: string): Promise<AnimeRecord[]> {
   return [];
 }
 
-async function getPrimaryWatchData(slug: string, episode: number, signal?: AbortSignal): Promise<WatchData> {
+async function getPrimaryWatchData(
+  slug: string,
+  episode: number,
+  signal?: AbortSignal,
+  requestId?: string,
+): Promise<WatchData> {
+  const diagnosticId = acceptedPlaybackRequestId(requestId);
+  const startedAt = Date.now();
   const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(45_000)]) : AbortSignal.timeout(45_000);
+  playbackLog(diagnosticId, "website.upstream.started", {
+    apiHost: playbackHost(animeApiBaseUrl),
+    slug,
+    episode,
+  });
   const response = await fetch(
     `${animeApiBaseUrl}/api/watch/${encodeURIComponent(slug)}?ep=${episode}&stream=false`,
-    { headers: { Accept: "application/json" }, signal: requestSignal },
+    {
+      headers: {
+        Accept: "application/json",
+        "X-Playback-Request-Id": diagnosticId,
+      },
+      cache: "no-store",
+      signal: requestSignal,
+    },
   );
+  playbackLog(diagnosticId, "website.upstream.response", {
+    status: response.status,
+    upstreamRequestId: response.headers.get("x-playback-request-id") || "",
+    elapsedMs: Date.now() - startedAt,
+  }, response.ok ? "info" : "warn");
   if (!response.ok) throw new Error(`Video servers failed to load (${response.status}).`);
   const payload = unwrapData((await response.json()) as unknown);
   if (!isRecord(payload)) throw new Error("The video response was invalid.");
@@ -668,22 +699,50 @@ async function getPrimaryWatchData(slug: string, episode: number, signal?: Abort
   if (!data.sources.some((source) => Boolean(source.proxyUrl || source.m3u8 || source.url))) {
     throw new Error("The video provider returned no playable sources.");
   }
+  playbackLog(diagnosticId, "website.upstream.parsed", {
+    sourceCount: data.sources.length,
+    serverCount: data.servers.length,
+    mediaHosts: [...new Set(data.sources.map((source) =>
+      playbackHost(source.proxyUrl || source.m3u8 || source.url)).filter(Boolean))],
+    elapsedMs: Date.now() - startedAt,
+  });
   return data;
 }
 
-export async function getWatchData(slug: string, episode: number, signal?: AbortSignal): Promise<WatchData> {
+export async function getWatchData(
+  slug: string,
+  episode: number,
+  signal?: AbortSignal,
+  requestId?: string,
+): Promise<WatchData> {
+  const diagnosticId = acceptedPlaybackRequestId(requestId);
   const key = `${slug.toLocaleLowerCase()}:${episode}`;
   const cached = watchCache.get(key);
-  if (!signal && cached && cached.expires > Date.now()) return cached.value;
+  if (!signal && cached && cached.expires > Date.now()) {
+    playbackLog(diagnosticId, "website.server_cache_hit", {
+      sourceCount: cached.value.sources.length,
+    });
+    return cached.value;
+  }
   if (!signal) {
     const existing = watchInFlight.get(key);
-    if (existing) return existing;
+    if (existing) {
+      playbackLog(diagnosticId, "website.server_inflight_joined");
+      return existing;
+    }
   }
 
-  const request = getPrimaryWatchData(slug, episode, signal).then((data) => {
-    if (!signal) setBoundedCache(watchCache, key, { expires: Date.now() + 60_000, value: data }, 120);
-    return data;
-  });
+  const request = getPrimaryWatchData(slug, episode, signal, diagnosticId)
+    .then((data) => {
+      if (!signal) setBoundedCache(watchCache, key, { expires: Date.now() + 60_000, value: data }, 120);
+      return data;
+    })
+    .catch((error) => {
+      playbackLog(diagnosticId, "website.server_resolution_failed", {
+        error: safePlaybackMessage(error),
+      }, "error");
+      throw error;
+    });
 
   if (!signal) {
     watchInFlight.set(key, request);

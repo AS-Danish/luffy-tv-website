@@ -1,4 +1,10 @@
 import type { AnimeRecord, WatchData } from "@/lib/anime-data";
+import {
+  newPlaybackRequestId,
+  playbackDiagnosticsEnabled,
+  playbackLog,
+  safePlaybackMessage,
+} from "@/lib/playback-diagnostics";
 
 const DEFAULT_API_BASE_URL = "https://anikoto-api-teramoto-danish.vercel.app";
 const clientCache = new Map<string, { expires: number; value: unknown }>();
@@ -30,17 +36,33 @@ async function requestCatalog<T>(
   ttl: number,
   signal?: AbortSignal,
   validate?: (value: T) => boolean,
+  diagnosticId?: string,
 ): Promise<T> {
   const cached = clientCache.get(path);
-  if (cached && cached.expires > Date.now()) {
+  if (!diagnosticId && cached && cached.expires > Date.now()) {
     const value = cached.value as T;
     if (!validate || validate(value)) return value;
     clientCache.delete(path);
   }
 
-  let request = clientInFlight.get(path) as Promise<T> | undefined;
+  let request = diagnosticId
+    ? undefined
+    : clientInFlight.get(path) as Promise<T> | undefined;
   if (!request) {
-    request = fetch(path, { headers: { Accept: "application/json" } }).then(async (response) => {
+    const startedAt = Date.now();
+    if (diagnosticId) playbackLog(diagnosticId, "client.catalog_request_started", { path });
+    request = fetch(path, {
+      headers: {
+        Accept: "application/json",
+        ...(diagnosticId ? { "X-Playback-Request-Id": diagnosticId } : {}),
+      },
+      cache: diagnosticId ? "no-store" : "default",
+    }).then(async (response) => {
+      if (diagnosticId) playbackLog(diagnosticId, "client.catalog_response", {
+        status: response.status,
+        serverRequestId: response.headers.get("x-playback-request-id") || "",
+        elapsedMs: Date.now() - startedAt,
+      }, response.ok ? "info" : "warn");
       const payload = await response.json() as { ok?: boolean; data?: T; message?: string };
       if (!response.ok || payload.ok !== true || payload.data === undefined) {
         throw new Error(payload.message || `Catalog request failed (${response.status})`);
@@ -50,8 +72,14 @@ async function requestCatalog<T>(
       }
       setClientCache(path, payload.data, ttl);
       return payload.data;
+    }).catch((error) => {
+      if (diagnosticId) playbackLog(diagnosticId, "client.catalog_request_failed", {
+        error: safePlaybackMessage(error),
+        elapsedMs: Date.now() - startedAt,
+      }, "error");
+      throw error;
     }).finally(() => clientInFlight.delete(path));
-    clientInFlight.set(path, request);
+    if (!diagnosticId) clientInFlight.set(path, request);
   }
   return awaitWithSignal(request, signal);
 }
@@ -74,12 +102,21 @@ export function getAnimeDetail(slug: string, signal?: AbortSignal) {
   );
 }
 
-export function getWatchData(slug: string, episode: number, signal?: AbortSignal) {
+export function getWatchData(
+  slug: string,
+  episode: number,
+  signal?: AbortSignal,
+  requestId?: string,
+) {
+  const diagnosticId = playbackDiagnosticsEnabled()
+    ? requestId || newPlaybackRequestId()
+    : undefined;
   return requestCatalog<WatchData>(
     `/api/catalog/watch/${encodeURIComponent(slug)}?episode=${episode}`,
     45 * 1000,
     signal,
     (data) => data.sources.some((source) => Boolean(source.proxyUrl || source.m3u8 || source.url)),
+    diagnosticId,
   );
 }
 

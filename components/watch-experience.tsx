@@ -9,6 +9,12 @@ import { playbackStorageKey, type SavedProgress } from "@/components/continue-wa
 import { EpisodeNavigator } from "@/components/episode-navigator";
 import { ArtworkImage } from "@/components/artwork-image";
 import { artworkUrl } from "@/lib/artwork";
+import {
+  newPlaybackRequestId,
+  playbackHost,
+  playbackLog,
+  safePlaybackMessage,
+} from "@/lib/playback-diagnostics";
 
 type Menu = "quality" | "captions" | "playback" | null;
 type QualityOption = { index: number; label: string };
@@ -93,6 +99,7 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
   const scrubbingRef = useRef(false);
   const scrubTimeRef = useRef<number | null>(null);
   const previewTargetTimeRef = useRef(0);
+  const playbackRequestIdRef = useRef(newPlaybackRequestId());
   const previewSeekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [episodeNumber, setEpisodeNumber] = useState(initialEpisode);
   const [watchData, setWatchData] = useState<WatchData | null>(null);
@@ -150,6 +157,14 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
 
   useEffect(() => {
     const controller = new AbortController();
+    const requestId = newPlaybackRequestId();
+    playbackRequestIdRef.current = requestId;
+    playbackLog(requestId, "player.load_started", {
+      slug: anime.slug,
+      episode: episodeNumber,
+      online: navigator.onLine,
+      userAgent: navigator.userAgent.slice(0, 160),
+    });
     setLoading(true);
     setError("");
     setWatchData(null);
@@ -159,13 +174,28 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
     failedSourcesRef.current.clear();
     const saved = readProgress(anime.slug);
     resumeAtRef.current = saved?.episode === episodeNumber ? saved.time : 0;
-    getWatchData(anime.slug, episodeNumber, controller.signal).then((data) => {
+    getWatchData(anime.slug, episodeNumber, controller.signal, requestId).then((data) => {
       if (!data.sources.length) throw new Error("No playable stream is currently available for this episode.");
+      playbackLog(requestId, "player.sources_received", {
+        sourceCount: data.sources.length,
+        serverCount: data.servers.length,
+        sources: data.sources.map((source) => ({
+          server: source.server,
+          type: source.type,
+          host: playbackHost(source.proxyUrl || source.m3u8 || source.url),
+          proxied: Boolean(source.proxyUrl),
+          captions: source.tracks.length,
+        })),
+      });
       setWatchData(data);
       const preferred = data.sources.findIndex((source) => source.type === "sub" && source.tracks.length > 0);
       setSourceIndex(preferred >= 0 ? preferred : 0);
     }).catch((reason: unknown) => {
       if (reason instanceof DOMException && reason.name === "AbortError") return;
+      playbackLog(requestId, "player.source_resolution_failed", {
+        error: safePlaybackMessage(reason),
+        online: navigator.onLine,
+      }, "error");
       setError(reason instanceof Error ? reason.message : "The player could not load this episode.");
       setLoading(false);
     });
@@ -195,6 +225,13 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
       if (resumeAtRef.current > 0 && resumeAtRef.current < video.duration - 15) video.currentTime = resumeAtRef.current;
       setDuration(Number.isFinite(video.duration) ? video.duration : 0);
       setLoading(false);
+      playbackLog(playbackRequestIdRef.current, "player.media_ready", {
+        sourceIndex,
+        server: activeSource?.server || "",
+        host: playbackHost(streamUrl),
+        duration: video.duration,
+        native,
+      });
       if (shouldAutoplayRef.current) video.play().catch(() => undefined);
       shouldAutoplayRef.current = false;
     };
@@ -203,6 +240,12 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
     void import("hls.js").then(({ default: HlsPlayer }) => {
       if (disposed) return;
       if (HlsPlayer.isSupported()) {
+        playbackLog(playbackRequestIdRef.current, "player.hls_attach", {
+          sourceIndex,
+          server: activeSource?.server || "",
+          host: playbackHost(streamUrl),
+          proxied: Boolean(activeSource?.proxyUrl),
+        });
         let networkRetries = 0;
         const hls = new HlsPlayer({
           enableWorker: true,
@@ -222,6 +265,16 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
           prepareVideo();
         });
         hls.on(HlsPlayer.Events.ERROR, (_event, data) => {
+          playbackLog(playbackRequestIdRef.current, "player.hls_error", {
+            sourceIndex,
+            server: activeSource?.server || "",
+            host: playbackHost(streamUrl),
+            type: data.type,
+            details: data.details,
+            fatal: data.fatal,
+            responseCode: data.response?.code,
+            networkRetries,
+          }, data.fatal ? "error" : "warn");
           if (!data.fatal) return;
           if (data.type === HlsPlayer.ErrorTypes.NETWORK_ERROR && networkRetries < 1) {
             networkRetries += 1;
@@ -248,17 +301,26 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
         video.addEventListener("loadedmetadata", prepareVideo, { once: true });
         video.load();
       } else {
+        playbackLog(playbackRequestIdRef.current, "player.hls_unsupported", {
+          userAgent: navigator.userAgent.slice(0, 160),
+        }, "error");
         setError("This browser cannot play HLS video.");
         setLoading(false);
       }
-    }).catch(() => { setError("The HLS player failed to initialize."); setLoading(false); });
+    }).catch((reason) => {
+      playbackLog(playbackRequestIdRef.current, "player.hls_initialization_failed", {
+        error: safePlaybackMessage(reason),
+      }, "error");
+      setError("The HLS player failed to initialize.");
+      setLoading(false);
+    });
 
     return () => {
       disposed = true;
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
       if (native) video.removeAttribute("src");
     };
-  }, [sourceIndex, streamUrl, watchData]);
+  }, [activeSource?.proxyUrl, activeSource?.server, sourceIndex, streamUrl, watchData]);
 
   useEffect(() => {
     const controller = new AbortController();
