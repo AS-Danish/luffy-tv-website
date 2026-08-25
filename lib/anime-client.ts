@@ -25,9 +25,18 @@ function awaitWithSignal<T>(request: Promise<T>, signal?: AbortSignal) {
   });
 }
 
-async function requestCatalog<T>(path: string, ttl: number, signal?: AbortSignal): Promise<T> {
+async function requestCatalog<T>(
+  path: string,
+  ttl: number,
+  signal?: AbortSignal,
+  validate?: (value: T) => boolean,
+): Promise<T> {
   const cached = clientCache.get(path);
-  if (cached && cached.expires > Date.now()) return cached.value as T;
+  if (cached && cached.expires > Date.now()) {
+    const value = cached.value as T;
+    if (!validate || validate(value)) return value;
+    clientCache.delete(path);
+  }
 
   let request = clientInFlight.get(path) as Promise<T> | undefined;
   if (!request) {
@@ -35,6 +44,9 @@ async function requestCatalog<T>(path: string, ttl: number, signal?: AbortSignal
       const payload = await response.json() as { ok?: boolean; data?: T; message?: string };
       if (!response.ok || payload.ok !== true || payload.data === undefined) {
         throw new Error(payload.message || `Catalog request failed (${response.status})`);
+      }
+      if (validate && !validate(payload.data)) {
+        throw new Error("No playable stream is currently available for this episode.");
       }
       setClientCache(path, payload.data, ttl);
       return payload.data;
@@ -67,6 +79,7 @@ export function getWatchData(slug: string, episode: number, signal?: AbortSignal
     `/api/catalog/watch/${encodeURIComponent(slug)}?episode=${episode}`,
     45 * 1000,
     signal,
+    (data) => data.sources.some((source) => Boolean(source.proxyUrl || source.m3u8 || source.url)),
   );
 }
 

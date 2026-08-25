@@ -632,7 +632,7 @@ async function getPrimaryWatchData(slug: string, episode: number, signal?: Abort
     ? { start: numberValue(value.start), end: numberValue(value.end) }
     : undefined;
 
-  return {
+  const data: WatchData = {
     episode: {
       number: numberValue(episodeRaw.number, episode),
       title: stringValue(episodeRaw.title, `Episode ${episode}`),
@@ -665,6 +665,10 @@ async function getPrimaryWatchData(slug: string, episode: number, signal?: Abort
       })),
     })).filter((source) => source.proxyUrl || source.m3u8 || source.url),
   };
+  if (!data.sources.some((source) => Boolean(source.proxyUrl || source.m3u8 || source.url))) {
+    throw new Error("The video provider returned no playable sources.");
+  }
+  return data;
 }
 
 export async function getWatchData(slug: string, episode: number, signal?: AbortSignal): Promise<WatchData> {

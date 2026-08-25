@@ -1,4 +1,4 @@
-import { apiError, cachedJson, validSlug } from "@/lib/api-response";
+import { apiError, validSlug } from "@/lib/api-response";
 import { getWatchData } from "@/lib/anime-data";
 
 export async function GET(request: Request, { params }: { params: Promise<{ slug: string }> }) {
@@ -8,7 +8,10 @@ export async function GET(request: Request, { params }: { params: Promise<{ slug
     return apiError("Invalid anime slug or episode number.", 400);
   }
   try {
-    return cachedJson(await getWatchData(slug, episode), 10, 60, 120);
+    return Response.json(
+      { ok: true, data: await getWatchData(slug, episode) },
+      { headers: { "Cache-Control": "private, no-store" } },
+    );
   } catch {
     return apiError("Video servers are temporarily unavailable.", 503);
   }
