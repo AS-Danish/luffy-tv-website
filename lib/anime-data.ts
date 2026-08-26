@@ -638,17 +638,26 @@ async function getPrimaryWatchData(
     slug,
     episode,
   });
-  const response = await fetch(
-    `${animeApiBaseUrl}/api/watch/${encodeURIComponent(slug)}?ep=${episode}&stream=false`,
-    {
+  const upstreamUrl = `${animeApiBaseUrl}/api/watch/${encodeURIComponent(slug)}?ep=${episode}&stream=false`;
+  let response: Response | undefined;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    response = await fetch(upstreamUrl, {
       headers: {
         Accept: "application/json",
         "X-Playback-Request-Id": diagnosticId,
       },
       cache: "no-store",
       signal: requestSignal,
-    },
-  );
+    });
+    playbackLog(diagnosticId, "website.upstream.attempt", {
+      attempt,
+      status: response.status,
+      elapsedMs: Date.now() - startedAt,
+    }, response.ok ? "info" : "warn");
+    if (response.ok || ![500, 502, 503, 504].includes(response.status) || attempt === 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  if (!response) throw new Error("Video servers did not respond.");
   playbackLog(diagnosticId, "website.upstream.response", {
     status: response.status,
     upstreamRequestId: response.headers.get("x-playback-request-id") || "",
