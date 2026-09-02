@@ -4,6 +4,7 @@ import {
   playbackLog,
   safePlaybackMessage,
 } from "@/lib/playback-diagnostics";
+import { catalogMalId, normalizedTitle } from "@/lib/trailer-resolver";
 
 export type AnimeTrailer = {
   id: string;
@@ -13,6 +14,8 @@ export type AnimeTrailer = {
 
 export type AnimeRecord = {
   id: string;
+  malId?: number;
+  releaseYear?: number;
   slug: string;
   title: string;
   eyebrow: string;
@@ -101,6 +104,7 @@ export type ScheduleDay = {
 type JsonRecord = Record<string, unknown>;
 
 type AniListArtwork = {
+  malId?: number;
   cover?: string;
   banner?: string;
   color?: string;
@@ -132,6 +136,7 @@ const watchCache = new Map<string, { expires: number; value: WatchData }>();
 const watchInFlight = new Map<string, Promise<WatchData>>();
 const upstreamBackoff = new Map<string, { failures: number; blockedUntil: number }>();
 let artworkHydration: Promise<void> | null = null;
+let artworkBlockedUntil = 0;
 
 export const animeApiBaseUrl = (
   process.env.NEXT_PUBLIC_ANIME_API_BASE_URL || DEFAULT_API_BASE_URL
@@ -228,6 +233,31 @@ function normalizeAnimeSlug(value: string) {
     .replace(/^\/+|\/+$/g, "");
 }
 
+function normalizeTrailer(value: unknown): AnimeTrailer | undefined {
+  if (!isRecord(value)) return undefined;
+  const site = stringValue(value.site, stringValue(value.provider));
+  let id = stringValue(value.id, stringValue(value.videoId, stringValue(value.url)));
+  if (!site || !id) return undefined;
+
+  if (site.toLowerCase() === "youtube") {
+    try {
+      const url = new URL(id);
+      id = url.hostname.includes("youtu.be")
+        ? url.pathname.split("/").filter(Boolean)[0] || ""
+        : url.searchParams.get("v") || url.pathname.match(/\/(?:embed|shorts)\/([^/?#]+)/)?.[1] || "";
+    } catch {
+      // AniList normally supplies a bare YouTube video id.
+    }
+  }
+
+  if (!id) return undefined;
+  return {
+    id,
+    site,
+    thumbnail: stringValue(value.thumbnail) || undefined,
+  };
+}
+
 function normalizeAnime(raw: JsonRecord, overrides: Partial<AnimeRecord> = {}): AnimeRecord {
   const episodes = episodeStatus(raw);
   const title = stringValue(raw.title, "Untitled anime");
@@ -244,6 +274,8 @@ function normalizeAnime(raw: JsonRecord, overrides: Partial<AnimeRecord> = {}): 
 
   return {
     id: stringValue(raw.id, slug),
+    malId: catalogMalId(raw),
+    releaseYear: [raw.premiered, raw.aired].map((value) => Number(stringValue(value).match(/(?:19|20)\d{2}/)?.[0])).find((year) => year > 0),
     slug,
     title,
     eyebrow: stringValue(raw.quality) ? `${stringValue(raw.quality)} streaming` : "Now on Luffy TV",
@@ -266,6 +298,7 @@ function normalizeAnime(raw: JsonRecord, overrides: Partial<AnimeRecord> = {}): 
     poster: posterImage || image || "/luffy-tv-logo-256.png",
     backdrop: backdropImage || image || posterImage || "/luffy-tv-logo-256.png",
     accent: "#ff671d",
+    trailer: normalizeTrailer(raw.trailer),
     ...overrides,
   };
 }
@@ -360,11 +393,10 @@ function parseAniListMedia(value: unknown): AniListArtwork | null {
   const studios = isRecord(value.studios) && Array.isArray(value.studios.nodes)
     ? value.studios.nodes.filter(isRecord)
     : [];
-  const trailer = isRecord(value.trailer) ? value.trailer : null;
-  const trailerId = trailer ? stringValue(trailer.id) : "";
-  const trailerSite = trailer ? stringValue(trailer.site) : "";
+  const trailer = normalizeTrailer(value.trailer);
 
   return {
+    malId: numberValue(value.idMal) || undefined,
     cover: stringValue(cover.extraLarge, stringValue(cover.large)),
     banner: stringValue(value.bannerImage),
     color: stringValue(cover.color),
@@ -378,18 +410,17 @@ function parseAniListMedia(value: unknown): AniListArtwork | null {
     status: stringValue(value.status),
     japaneseTitle: stringValue(title.native),
     studio: studios.length ? stringValue(studios[0].name) : "",
-    trailer: trailerId && trailerSite ? {
-      id: trailerId,
-      site: trailerSite,
-      thumbnail: stringValue(trailer?.thumbnail) || undefined,
-    } : undefined,
+    trailer,
   };
 }
 
 async function fetchArtworkChunk(titles: string[]) {
+  if (artworkBlockedUntil > Date.now()) throw new Error("AniList is temporarily unavailable");
   const fields = titles.map((title, index) => `
     a${index}: Media(search: ${JSON.stringify(title)}, type: ANIME) {
-      title { native }
+      idMal
+      title { native english romaji }
+      synonyms
       coverImage { extraLarge large color }
       bannerImage
       description
@@ -410,10 +441,23 @@ async function fetchArtworkChunk(titles: string[]) {
     body: JSON.stringify({ query: `query LuffyArtwork { ${fields} }` }),
     signal: AbortSignal.timeout(6_500),
   });
-  if (!response.ok) throw new Error(`AniList artwork request failed (${response.status})`);
   const payload = (await response.json()) as unknown;
   const data = isRecord(payload) && isRecord(payload.data) ? payload.data : {};
-  return titles.map((title, index) => ({ title, artwork: parseAniListMedia(data[`a${index}`]) }));
+  if (!response.ok && !Object.values(data).some(isRecord)) {
+    if (response.status === 403 || response.status === 429 || response.status >= 500) artworkBlockedUntil = Date.now() + 60_000;
+    throw new Error(`AniList artwork request failed (${response.status})`);
+  }
+  return titles.map((title, index) => {
+    const media = data[`a${index}`];
+    const artwork = parseAniListMedia(media);
+    const aliases = isRecord(media) && isRecord(media.title)
+      ? [...Object.values(media.title), ...stringArray(media.synonyms)].map((value) => normalizedTitle(stringValue(value))) : [];
+    // AniList search is fuzzy. Do not attach another season's trailer/MAL id.
+    if (artwork && !aliases.includes(normalizedTitle(title))) {
+      return { title, artwork: null };
+    }
+    return { title, artwork };
+  });
 }
 
 async function hydrateArtwork(titles: string[]) {
@@ -479,6 +523,8 @@ function applyArtwork(anime: AnimeRecord, artwork: AniListArtwork | null | undef
   const originalBackdrop = anime.backdrop === "/luffy-tv-logo-256.png" ? "" : anime.backdrop;
   return {
     ...anime,
+    malId: anime.malId || artwork.malId,
+    releaseYear: artwork.year || anime.releaseYear,
     poster: artwork.cover || anime.poster,
     backdrop: artwork.banner || originalBackdrop || artwork.cover || anime.poster,
     accent: artwork.color || anime.accent,
@@ -494,7 +540,7 @@ function applyArtwork(anime: AnimeRecord, artwork: AniListArtwork | null | undef
     status: artwork.status ? normalizeStatus(artwork.status) : anime.status,
     japaneseTitle: artwork.japaneseTitle || anime.japaneseTitle,
     studio: artwork.studio || anime.studio,
-    trailer: artwork.trailer,
+    trailer: artwork.trailer ?? anime.trailer,
   };
 }
 
@@ -770,24 +816,49 @@ export function absoluteApiUrl(url?: string | null) {
 
 export async function getSchedule(timezoneOffset = 0): Promise<ScheduleDay[]> {
   try {
-    const payload = unwrapData(await fetchJson(`/api/schedule?tz=${Math.trunc(timezoneOffset)}&images=true`));
+    const wholeHourOffset = Math.trunc(timezoneOffset);
+    const minuteAdjustment = Math.round((timezoneOffset - wholeHourOffset) * 60);
+    let payload: unknown;
+    try {
+      payload = unwrapData(await fetchJson(
+        `/api/schedule?tz=${wholeHourOffset}&images=true`,
+        RESPONSE_CACHE_TTL,
+        20_000,
+      ));
+    } catch {
+      payload = unwrapData(await fetchJson(
+        `/api/schedule?tz=${wholeHourOffset}&images=false`,
+        60_000,
+        10_000,
+      ));
+    }
     if (!Array.isArray(payload)) throw new Error("Invalid schedule response");
     const rawDays = payload.filter(isRecord);
     const allRaw = rawDays.flatMap((day) => recordArray(day.animes));
-    const enhanced = await enrichAnimeWithin(allRaw.map((item) => normalizeAnime(item)), 6_000);
+    const normalized = allRaw.map((item) => normalizeAnime(item));
+    const needsArtwork = normalized.some((anime) => anime.poster === "/luffy-tv-logo-256.png");
+    const enhanced = needsArtwork ? await enrichAnimeWithin(normalized, 6_000) : normalized;
     const bySlug = new Map(enhanced.map((item) => [item.slug, item]));
+    const adjustedTime = (value: unknown) => {
+      const time = stringValue(value, "TBA");
+      const match = time.match(/^(\d{1,2}):(\d{2})$/);
+      if (!match || !minuteAdjustment) return time;
+      const totalMinutes = (Number(match[1]) * 60 + Number(match[2]) + minuteAdjustment + 24 * 60) % (24 * 60);
+      return `${String(Math.floor(totalMinutes / 60)).padStart(2, "0")}:${String(totalMinutes % 60).padStart(2, "0")}`;
+    };
     return rawDays.map((day) => ({
       day: stringValue(day.day),
       releases: recordArray(day.animes).map((item) => {
         const anime = bySlug.get(stringValue(item.slug)) || normalizeAnime(item);
         return {
-          time: stringValue(item.date, "TBA"),
+          time: adjustedTime(item.date),
           anime,
           episode: stringValue(item.type, "New episode").replace(/^Episode\s*/i, ""),
         };
       }),
     }));
-  } catch {
+  } catch (error) {
+    console.error("[schedule] Unable to load the live schedule", error);
     return [];
   }
 }

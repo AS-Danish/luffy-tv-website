@@ -7,6 +7,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { AnimeRecord } from "@/lib/anime-data";
 import { ListButton } from "@/components/list-button";
 import { ArtworkImage } from "@/components/artwork-image";
+import { claimTrailerPrefetch, requestTrailer } from "@/lib/trailer-client";
+import type { TrailerResult } from "@/lib/trailer-resolver";
 
 type AnimeCardProps = {
   anime: AnimeRecord;
@@ -20,14 +22,43 @@ type PreviewPosition = { left: number; top: number; width: number };
 export function AnimeCard({ anime, rank, compact = false, priority = false }: AnimeCardProps) {
   const router = useRouter();
   const anchorRef = useRef<HTMLAnchorElement>(null);
-  const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [preview, setPreview] = useState(false);
   const [position, setPosition] = useState<PreviewPosition | null>(null);
   const [opening, setOpening] = useState(false);
+  const [resolvedTrailer, setResolvedTrailer] = useState<{ slug: string; result: TrailerResult } | null>(null);
+  const mounted = useRef(false);
+  const suppliedTrailer = anime.trailer?.site.toLowerCase() === "youtube" && /^[\w-]{11}$/.test(anime.trailer.id) ? anime.trailer.id : "";
+  const trailerResult = resolvedTrailer?.slug === anime.slug ? resolvedTrailer.result : null;
+  const youtubeTrailer = suppliedTrailer || (trailerResult?.status === "ready" ? trailerResult.trailer.id : "");
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  const loadTrailer = useCallback(() => {
+    if (suppliedTrailer) return;
+    void requestTrailer(anime.slug).then((result) => {
+      if (mounted.current) setResolvedTrailer({ slug: anime.slug, result });
+    });
+  }, [anime.slug, suppliedTrailer]);
+
+  useEffect(() => {
+    const anchor = anchorRef.current;
+    if (suppliedTrailer || !anchor || !window.matchMedia("(hover: hover) and (min-width: 761px)").matches || !("IntersectionObserver" in window)) return;
+    // Warm only a few visible cards, not every card in every rail.
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        observer.disconnect();
+        if (claimTrailerPrefetch()) loadTrailer();
+      }
+    }, { threshold: 0.5 });
+    observer.observe(anchor);
+    return () => observer.disconnect();
+  }, [loadTrailer, suppliedTrailer]);
 
   const clearTimers = useCallback(() => {
-    if (openTimer.current) clearTimeout(openTimer.current);
     if (closeTimer.current) clearTimeout(closeTimer.current);
   }, []);
 
@@ -50,14 +81,12 @@ export function AnimeCard({ anime, rank, compact = false, priority = false }: An
     clearTimers();
     router.prefetch(`/anime/${anime.slug}`);
     if (window.matchMedia("(max-width: 760px)").matches) return;
-    openTimer.current = setTimeout(() => {
-      calculatePosition();
-      setPreview(true);
-    }, 1000);
+    calculatePosition();
+    setPreview(true);
+    loadTrailer();
   };
 
   const requestClose = () => {
-    if (openTimer.current) clearTimeout(openTimer.current);
     closeTimer.current = setTimeout(() => setPreview(false), 150);
   };
 
@@ -70,8 +99,6 @@ export function AnimeCard({ anime, rank, compact = false, priority = false }: An
     setPreview(false);
     setOpening(true);
   };
-
-  const youtubeTrailer = anime.trailer?.site.toLowerCase() === "youtube" ? anime.trailer.id : "";
 
   return (
     <>
@@ -125,11 +152,16 @@ export function AnimeCard({ anime, rank, compact = false, priority = false }: An
                 src={`https://www.youtube-nocookie.com/embed/${youtubeTrailer}?autoplay=1&mute=1&controls=0&loop=1&playlist=${youtubeTrailer}&modestbranding=1&playsinline=1&rel=0`}
                 title={`${anime.title} trailer`}
                 allow="autoplay; encrypted-media; picture-in-picture"
+                loading="eager"
+                referrerPolicy="strict-origin-when-cross-origin"
               />
             ) : (
               <ArtworkImage src={anime.backdrop} fallbacks={[anime.poster]} alt="" />
             )}
             <span className="preview-media-shade" />
+            {!youtubeTrailer ? <span className="preview-trailer-status" role="status">
+              {!trailerResult ? "Finding trailer…" : trailerResult.status === "unavailable" ? "Trailer provider unavailable — try again later" : "No trailer available"}
+            </span> : null}
             <span className="preview-quality">{anime.quality}</span>
           </Link>
           <div className="preview-copy">
