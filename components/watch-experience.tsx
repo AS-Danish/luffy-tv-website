@@ -92,6 +92,9 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
   const hlsRef = useRef<Hls | null>(null);
   const previewHlsRef = useRef<Hls | null>(null);
   const failedSourcesRef = useRef(new Set<number>());
+  const failedCaptionKeysRef = useRef(new Set<string>());
+  const sourceRefreshesRef = useRef(0);
+  const forceReloadRef = useRef(false);
   const resumeAtRef = useRef(0);
   const shouldAutoplayRef = useRef(false);
   const lastSavedRef = useRef(0);
@@ -127,6 +130,7 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
   const [previewFailed, setPreviewFailed] = useState(false);
   const [menu, setMenu] = useState<Menu>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
+  const [reloadToken, setReloadToken] = useState(0);
 
   const activeEpisode = episodes.find((episode) => episode.number === episodeNumber) || episodes[0];
   const nextEpisode = episodes.find((episode) => episode.number === episodeNumber + 1);
@@ -172,9 +176,13 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
     setQualities([]);
     setQualityIndex(-1);
     failedSourcesRef.current.clear();
+    failedCaptionKeysRef.current.clear();
+    sourceRefreshesRef.current = 0;
     const saved = readProgress(anime.slug);
     resumeAtRef.current = saved?.episode === episodeNumber ? saved.time : 0;
-    getWatchData(anime.slug, episodeNumber, controller.signal, requestId).then((data) => {
+    const forceRefresh = forceReloadRef.current;
+    forceReloadRef.current = false;
+    getWatchData(anime.slug, episodeNumber, controller.signal, requestId, forceRefresh).then((data) => {
       if (!data.sources.length) throw new Error("No playable stream is currently available for this episode.");
       playbackLog(requestId, "player.sources_received", {
         sourceCount: data.sources.length,
@@ -200,7 +208,7 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
       setLoading(false);
     });
     return () => controller.abort();
-  }, [anime.slug, episodeNumber]);
+  }, [anime.slug, episodeNumber, reloadToken]);
 
   useEffect(() => {
     const defaultCaption = captions.findIndex((track) => track.default);
@@ -213,6 +221,8 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
     const video = videoRef.current;
     if (!video || !streamUrl) return;
     let disposed = false;
+    let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+    let stallWatchdog: ReturnType<typeof setInterval> | undefined;
     video.pause();
     setPlaying(false);
     setLoading(true);
@@ -220,9 +230,73 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
     setQualities([]);
     setQualityIndex(-1);
 
+    const moveToNextSource = (reason: string) => {
+      if (disposed) return;
+      failedSourcesRef.current.add(sourceIndex);
+      const sources = watchData?.sources || [];
+      const currentHost = playbackHost(streamUrl);
+      const compatible = (source: typeof sources[number], index: number) =>
+        !failedSourcesRef.current.has(index) && source.type === activeSource?.type;
+      const hasCaptions = (source: typeof sources[number]) =>
+        source.tracks.some((track) => track.kind === "captions" || track.kind === "subtitles");
+      let nextSource = sources.findIndex((source, index) =>
+        compatible(source, index) && playbackHost(source.proxyUrl || source.m3u8 || source.url) !== currentHost &&
+        (!captions.length || hasCaptions(source)));
+      if (nextSource < 0) nextSource = sources.findIndex((source, index) =>
+        compatible(source, index) && (!captions.length || hasCaptions(source)));
+      if (nextSource < 0) nextSource = sources.findIndex(compatible);
+      playbackLog(playbackRequestIdRef.current, "player.source_failover", {
+        reason,
+        sourceIndex,
+        nextSource,
+        server: activeSource?.server || "",
+        host: currentHost,
+      }, "warn");
+      resumeAtRef.current = video.currentTime || resumeAtRef.current;
+      shouldAutoplayRef.current = !video.paused;
+      if (nextSource >= 0) {
+        setSourceIndex(nextSource);
+        return;
+      }
+      if (sourceRefreshesRef.current >= 2) {
+        setError("Every resolved server is currently unavailable. Retry in a moment.");
+        setLoading(false);
+        return;
+      }
+      sourceRefreshesRef.current += 1;
+      setLoading(true);
+      void getWatchData(
+        anime.slug,
+        episodeNumber,
+        undefined,
+        playbackRequestIdRef.current,
+        true,
+      ).then((fresh) => {
+        if (disposed) return;
+        if (!fresh.sources.length) throw new Error("The refresh returned no playable sources.");
+        let refreshedIndex = fresh.sources.findIndex((source) =>
+          source.type === activeSource?.type &&
+          playbackHost(source.proxyUrl || source.m3u8 || source.url) !== currentHost &&
+          (!captions.length || hasCaptions(source)));
+        if (refreshedIndex < 0) refreshedIndex = fresh.sources.findIndex((source) =>
+          source.type === activeSource?.type && (!captions.length || hasCaptions(source)));
+        failedSourcesRef.current.clear();
+        setWatchData(fresh);
+        setSourceIndex(refreshedIndex >= 0 ? refreshedIndex : 0);
+      }).catch((failure: unknown) => {
+        if (disposed) return;
+        playbackLog(playbackRequestIdRef.current, "player.source_refresh_failed", {
+          error: safePlaybackMessage(failure),
+        }, "error");
+        setError("Every resolved server is currently unavailable. Retry in a moment.");
+        setLoading(false);
+      });
+    };
+
     const prepareVideo = () => {
       if (disposed) return;
-      if (resumeAtRef.current > 0 && resumeAtRef.current < video.duration - 15) video.currentTime = resumeAtRef.current;
+      if (resumeAtRef.current > 0 && resumeAtRef.current < video.duration - 1) video.currentTime = resumeAtRef.current;
+      resumeAtRef.current = 0;
       setDuration(Number.isFinite(video.duration) ? video.duration : 0);
       setLoading(false);
       playbackLog(playbackRequestIdRef.current, "player.media_ready", {
@@ -235,6 +309,7 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
       if (shouldAutoplayRef.current) video.play().catch(() => undefined);
       shouldAutoplayRef.current = false;
     };
+    const handleNativeError = () => moveToNextSource("native_media_error");
 
     let native = false;
     void import("hls.js").then(({ default: HlsPlayer }) => {
@@ -247,6 +322,8 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
           proxied: Boolean(activeSource?.proxyUrl),
         });
         let networkRetries = 0;
+        let mediaRetries = 0;
+        let stallRetries = 0;
         const hls = new HlsPlayer({
           enableWorker: true,
           capLevelToPlayerSize: true,
@@ -255,15 +332,55 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
           manifestLoadingTimeOut: 12_000,
           levelLoadingTimeOut: 12_000,
           fragLoadingTimeOut: 18_000,
+          maxBufferHole: 0.5,
+          highBufferWatchdogPeriod: 2,
+          nudgeMaxRetry: 5,
         });
         hlsRef.current = hls;
+        video.addEventListener("loadedmetadata", prepareVideo, { once: true });
         hls.loadSource(streamUrl);
         hls.attachMedia(video);
         hls.on(HlsPlayer.Events.MANIFEST_PARSED, () => {
           const options = hls.levels.map((level, index) => ({ index, label: level.height ? `${level.height}p` : level.bitrate ? `${Math.round(level.bitrate / 1000)} kbps` : `Level ${index + 1}` }));
           setQualities(options.filter((option, index) => options.findIndex((candidate) => candidate.label === option.label) === index));
-          prepareVideo();
         });
+        let lastProgressAt = Date.now();
+        let lastObservedTime = video.currentTime;
+        let watchdogRecoveries = 0;
+        stallWatchdog = setInterval(() => {
+          if (disposed || video.paused || video.ended || video.seeking || document.hidden) {
+            lastObservedTime = video.currentTime;
+            lastProgressAt = Date.now();
+            return;
+          }
+          if (video.currentTime > lastObservedTime + 0.2) {
+            lastObservedTime = video.currentTime;
+            lastProgressAt = Date.now();
+            watchdogRecoveries = 0;
+            return;
+          }
+          if (Date.now() - lastProgressAt < 12_000) return;
+          watchdogRecoveries += 1;
+          lastProgressAt = Date.now();
+          playbackLog(playbackRequestIdRef.current, "player.progress_stalled", {
+            sourceIndex,
+            server: activeSource?.server || "",
+            host: playbackHost(streamUrl),
+            currentTime: video.currentTime,
+            readyState: video.readyState,
+            recoveries: watchdogRecoveries,
+          }, "warn");
+          if (watchdogRecoveries <= 2) {
+            hls.startLoad(video.currentTime, true);
+            if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+              video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 0.05);
+            }
+            return;
+          }
+          clearInterval(stallWatchdog);
+          hls.destroy();
+          moveToNextSource("progress_stalled");
+        }, 4_000);
         hls.on(HlsPlayer.Events.ERROR, (_event, data) => {
           playbackLog(playbackRequestIdRef.current, "player.hls_error", {
             sourceIndex,
@@ -274,31 +391,51 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
             fatal: data.fatal,
             responseCode: data.response?.code,
             networkRetries,
+            stallRetries,
           }, data.fatal ? "error" : "warn");
-          if (!data.fatal) return;
-          if (data.type === HlsPlayer.ErrorTypes.NETWORK_ERROR && networkRetries < 1) {
-            networkRetries += 1;
-            hls.startLoad();
+          if (disposed || recoveryTimer) return;
+          if (!data.fatal && data.details === HlsPlayer.ErrorDetails.BUFFER_STALLED_ERROR && stallRetries < 2) {
+            stallRetries += 1;
+            recoveryTimer = setTimeout(() => {
+              recoveryTimer = undefined;
+              if (!disposed) hls.startLoad(video.currentTime, true);
+            }, stallRetries * 750);
+            return;
           }
-          else if (data.type === HlsPlayer.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-          else {
-            failedSourcesRef.current.add(sourceIndex);
-            const nextSource = watchData?.sources.findIndex((_source, index) => !failedSourcesRef.current.has(index)) ?? -1;
-            if (nextSource >= 0) {
-              resumeAtRef.current = video.currentTime || resumeAtRef.current;
-              shouldAutoplayRef.current = true;
-              setSourceIndex(nextSource);
-            } else {
-              setError("Every resolved server is currently unavailable. Retry in a moment.");
-              setLoading(false);
-            }
+          if (!data.fatal) return;
+          const expiredSource = data.type === HlsPlayer.ErrorTypes.NETWORK_ERROR &&
+            [401, 403, 404, 410].includes(data.response?.code || 0);
+          if (expiredSource) {
             hls.destroy();
+            moveToNextSource("expired_or_rejected_url");
+          }
+          else if (data.type === HlsPlayer.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
+            networkRetries += 1;
+            recoveryTimer = setTimeout(() => {
+              recoveryTimer = undefined;
+              if (disposed) return;
+              if (data.details === HlsPlayer.ErrorDetails.MANIFEST_LOAD_ERROR ||
+                  data.details === HlsPlayer.ErrorDetails.MANIFEST_LOAD_TIMEOUT) {
+                hls.loadSource(streamUrl);
+              } else {
+                hls.startLoad(video.currentTime, true);
+              }
+            }, networkRetries * 1000);
+          }
+          else if (data.type === HlsPlayer.ErrorTypes.MEDIA_ERROR && mediaRetries < 1) {
+            mediaRetries += 1;
+            hls.recoverMediaError();
+          }
+          else {
+            hls.destroy();
+            moveToNextSource("fatal_hls_error");
           }
         });
       } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
         native = true;
         video.src = streamUrl;
         video.addEventListener("loadedmetadata", prepareVideo, { once: true });
+        video.addEventListener("error", handleNativeError, { once: true });
         video.load();
       } else {
         playbackLog(playbackRequestIdRef.current, "player.hls_unsupported", {
@@ -317,10 +454,14 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
 
     return () => {
       disposed = true;
+      clearTimeout(recoveryTimer);
+      clearInterval(stallWatchdog);
+      video.removeEventListener("loadedmetadata", prepareVideo);
+      video.removeEventListener("error", handleNativeError);
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
       if (native) video.removeAttribute("src");
     };
-  }, [activeSource?.proxyUrl, activeSource?.server, sourceIndex, streamUrl, watchData]);
+  }, [activeSource?.proxyUrl, activeSource?.server, activeSource?.type, anime.slug, captions.length, episodeNumber, sourceIndex, streamUrl, watchData]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -347,13 +488,35 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
       })
       .catch((reason: unknown) => {
         if (reason instanceof DOMException && reason.name === "AbortError") return;
-        setCaptionError(`${selectedCaption.label} captions could not be loaded from this server.`);
+        const failedKey = selectedCaption.proxyUrl || selectedCaption.file || selectedCaption.label;
+        failedCaptionKeysRef.current.add(failedKey);
+        const nextCaption = captions.findIndex((track) =>
+          !failedCaptionKeysRef.current.has(track.proxyUrl || track.file || track.label));
+        if (nextCaption >= 0) {
+          setCaptionIndex(nextCaption);
+          return;
+        }
+        const nextSource = watchData?.sources.findIndex((source, index) =>
+          index !== sourceIndex && source.type === activeSource?.type &&
+          source.tracks.some((track) => {
+            const kind = track.kind.toLowerCase();
+            return (kind === "captions" || kind === "subtitles") &&
+              !failedCaptionKeysRef.current.has(track.proxyUrl || track.file || track.label);
+          })) ?? -1;
+        if (nextSource >= 0) {
+          const video = videoRef.current;
+          resumeAtRef.current = video?.currentTime || resumeAtRef.current;
+          shouldAutoplayRef.current = Boolean(video && !video.paused);
+          setSourceIndex(nextSource);
+          return;
+        }
+        setCaptionError(`${selectedCaption.label} captions could not be loaded from any matching server.`);
       })
       .finally(() => {
         if (!controller.signal.aborted) setCaptionLoading(false);
       });
     return () => controller.abort();
-  }, [selectedCaption]);
+  }, [activeSource?.type, captions, selectedCaption, sourceIndex, watchData?.sources]);
 
   useEffect(() => {
     const video = previewVideoRef.current;
@@ -582,7 +745,7 @@ export function WatchExperience({ anime, episodes, initialEpisode }: { anime: An
       <div className="player-vignette" />
       <header className="player-top"><button className="player-back" type="button" onClick={goBack} aria-label="Back to the previous page">←</button><div><span>{anime.title}</span><small>Episode {episodeNumber} · {activeEpisode?.title}</small></div><span className="live-indicator"><i /> STREAM READY</span></header>
       {loading ? <div className="player-loader"><i /><span>Resolving the best stream…</span></div> : null}
-      {error ? <div className="player-error"><strong>Playback issue</strong><p>{error}</p><button type="button" onClick={() => selectEpisode(episodeNumber)}>Retry</button></div> : null}
+      {error ? <div className="player-error"><strong>Playback issue</strong><p>{error}</p><button type="button" onClick={() => { forceReloadRef.current = true; setReloadToken((value) => value + 1); }}>Retry</button></div> : null}
       {!loading && !error && !embedFallback ? <button className={`big-play${playing ? " playing" : ""}`} type="button" onClick={togglePlayback} aria-label={playing ? "Pause" : "Play"}><span>{playing ? "Ⅱ" : "▶"}</span></button> : null}
       {captionIndex >= 0 && captionText ? <div className="player-caption" data-size={captionSize} aria-live="off">{captionText}</div> : null}
       {skipRange ? <button className="skip-range" type="button" onClick={() => { if (videoRef.current) videoRef.current.currentTime = skipRange.end; }}>{skipRange.label} <span>→</span></button> : null}

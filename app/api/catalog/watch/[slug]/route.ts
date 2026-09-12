@@ -10,13 +10,15 @@ export async function GET(request: Request, { params }: { params: Promise<{ slug
   const requestId = acceptedPlaybackRequestId(request.headers.get("x-playback-request-id"));
   const startedAt = Date.now();
   const { slug } = await params;
-  const episode = Number(new URL(request.url).searchParams.get("episode"));
+  const searchParams = new URL(request.url).searchParams;
+  const episode = Number(searchParams.get("episode"));
+  const forceRefresh = searchParams.get("recover") === "1";
   if (!validSlug(slug) || !Number.isInteger(episode) || episode < 1 || episode > 100_000) {
     return apiError("Invalid anime slug or episode number.", 400);
   }
   try {
     playbackLog(requestId, "website.watch.request", { slug, episode });
-    const data = await getWatchData(slug, episode, undefined, requestId);
+    const data = await getWatchData(slug, episode, undefined, requestId, forceRefresh);
     playbackLog(requestId, "website.watch.resolved", {
       sourceCount: data.sources.length,
       serverCount: data.servers.length,

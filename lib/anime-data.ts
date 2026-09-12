@@ -675,6 +675,7 @@ async function getPrimaryWatchData(
   episode: number,
   signal?: AbortSignal,
   requestId?: string,
+  forceRefresh = false,
 ): Promise<WatchData> {
   const diagnosticId = acceptedPlaybackRequestId(requestId);
   const startedAt = Date.now();
@@ -684,7 +685,7 @@ async function getPrimaryWatchData(
     slug,
     episode,
   });
-  const upstreamUrl = `${animeApiBaseUrl}/api/watch/${encodeURIComponent(slug)}?ep=${episode}&stream=false`;
+  const upstreamUrl = `${animeApiBaseUrl}/api/watch/${encodeURIComponent(slug)}?ep=${episode}&stream=false${forceRefresh ? "&recover=1" : ""}`;
   let response: Response | undefined;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     response = await fetch(upstreamUrl, {
@@ -769,17 +770,18 @@ export async function getWatchData(
   episode: number,
   signal?: AbortSignal,
   requestId?: string,
+  forceRefresh = false,
 ): Promise<WatchData> {
   const diagnosticId = acceptedPlaybackRequestId(requestId);
   const key = `${slug.toLocaleLowerCase()}:${episode}`;
   const cached = watchCache.get(key);
-  if (!signal && cached && cached.expires > Date.now()) {
+  if (!signal && !forceRefresh && cached && cached.expires > Date.now()) {
     playbackLog(diagnosticId, "website.server_cache_hit", {
       sourceCount: cached.value.sources.length,
     });
     return cached.value;
   }
-  if (!signal) {
+  if (!signal && !forceRefresh) {
     const existing = watchInFlight.get(key);
     if (existing) {
       playbackLog(diagnosticId, "website.server_inflight_joined");
@@ -787,7 +789,7 @@ export async function getWatchData(
     }
   }
 
-  const request = getPrimaryWatchData(slug, episode, signal, diagnosticId)
+  const request = getPrimaryWatchData(slug, episode, signal, diagnosticId, forceRefresh)
     .then((data) => {
       if (!signal) setBoundedCache(watchCache, key, { expires: Date.now() + 60_000, value: data }, 120);
       return data;
@@ -799,7 +801,7 @@ export async function getWatchData(
       throw error;
     });
 
-  if (!signal) {
+  if (!signal && !forceRefresh) {
     watchInFlight.set(key, request);
     void request.finally(() => {
       if (watchInFlight.get(key) === request) watchInFlight.delete(key);

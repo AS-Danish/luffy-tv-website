@@ -2,6 +2,7 @@ import type { AnimeRecord, WatchData } from "@/lib/anime-data";
 import {
   newPlaybackRequestId,
   playbackDiagnosticsEnabled,
+  playbackMonitoringEnabled,
   playbackLog,
   safePlaybackMessage,
 } from "@/lib/playback-diagnostics";
@@ -37,15 +38,16 @@ async function requestCatalog<T>(
   signal?: AbortSignal,
   validate?: (value: T) => boolean,
   diagnosticId?: string,
+  bypassCache = false,
 ): Promise<T> {
   const cached = clientCache.get(path);
-  if (!diagnosticId && cached && cached.expires > Date.now()) {
+  if (!bypassCache && cached && cached.expires > Date.now()) {
     const value = cached.value as T;
     if (!validate || validate(value)) return value;
     clientCache.delete(path);
   }
 
-  let request = diagnosticId
+  let request = bypassCache
     ? undefined
     : clientInFlight.get(path) as Promise<T> | undefined;
   if (!request) {
@@ -56,7 +58,7 @@ async function requestCatalog<T>(
         Accept: "application/json",
         ...(diagnosticId ? { "X-Playback-Request-Id": diagnosticId } : {}),
       },
-      cache: diagnosticId ? "no-store" : "default",
+      cache: bypassCache ? "no-store" : "default",
     }).then(async (response) => {
       if (diagnosticId) playbackLog(diagnosticId, "client.catalog_response", {
         status: response.status,
@@ -79,7 +81,7 @@ async function requestCatalog<T>(
       }, "error");
       throw error;
     }).finally(() => clientInFlight.delete(path));
-    if (!diagnosticId) clientInFlight.set(path, request);
+    if (!bypassCache) clientInFlight.set(path, request);
   }
   return awaitWithSignal(request, signal);
 }
@@ -107,16 +109,18 @@ export function getWatchData(
   episode: number,
   signal?: AbortSignal,
   requestId?: string,
+  forceRefresh = false,
 ) {
-  const diagnosticId = playbackDiagnosticsEnabled()
+  const diagnosticId = playbackDiagnosticsEnabled() || playbackMonitoringEnabled()
     ? requestId || newPlaybackRequestId()
     : undefined;
   return requestCatalog<WatchData>(
-    `/api/catalog/watch/${encodeURIComponent(slug)}?episode=${episode}`,
+    `/api/catalog/watch/${encodeURIComponent(slug)}?episode=${episode}${forceRefresh ? "&recover=1" : ""}`,
     45 * 1000,
     signal,
     (data) => data.sources.some((source) => Boolean(source.proxyUrl || source.m3u8 || source.url)),
     diagnosticId,
+    forceRefresh,
   );
 }
 
